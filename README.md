@@ -1,4 +1,4 @@
-# RL-Dominating
+# RL-Total-Dominating-main
 > Implementation of "Learn to Solve Total Dominating Set Problem with GNN and Reinforcement Learning"
 
 
