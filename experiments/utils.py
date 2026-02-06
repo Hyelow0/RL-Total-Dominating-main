@@ -52,13 +52,6 @@ def is_valid_mtds_check(nx_graph, node_set):
 def should_minimize(optimisation_target):
     return optimisation_target == OptimisationTarget.MTDS
 
-# [确认保留] 这个函数用于计算原始解大小
-def count_raw_size(spins, basis):
-    if basis == SpinBasis.BINARY:
-        return int(np.sum(spins == 0))
-    else:
-        return int(np.sum(spins == -1))
-
 ####################################################
 # TESTING ON GRAPHS
 ####################################################
@@ -80,23 +73,34 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
         device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.device(device)
 
+    # GET THE TARGET
     optimisation_target = env_args.get('optimisation_target', OptimisationTarget.DSP)
     is_minimization = should_minimize(optimisation_target)
+
+    # HELPER FUNCTION FOR NETWORK TESTING
     acting_in_reversible_spin_env = env_args['reversible_spins']
 
-    # 1. 确定 Constructive 模式下的 mask 目标
     if env_args['reversible_spins']:
         if env_args['spin_basis'] == SpinBasis.BINARY:
             allowed_action_state = (0, 1)
         elif env_args['spin_basis'] == SpinBasis.SIGNED:
             allowed_action_state = (1, -1)
     else:
-        # Constructive: 允许操作的状态永远是 "未选中" (通常是 1)
-        allowed_action_state = 1
+        if env_args['spin_basis'] == SpinBasis.BINARY:
+            allowed_action_state = 0
+        if env_args['spin_basis'] == SpinBasis.SIGNED:
+            allowed_action_state = 1
 
+    # 【辅助函数】只计算选中点的数量，不检查合法性，用于获取真实的 Raw Size
+    def count_raw_size(spins, basis):
+        if basis == SpinBasis.BINARY:
+            return int(np.sum(spins == 0))
+        else:
+            return int(np.sum(spins == -1))
+
+    # 确定目标值 (0 或 -1 代表选中)，用于 Validity Check
     target_val_def = 0 if env_args['spin_basis'] == SpinBasis.BINARY else -1
 
-    # --- 修复后的 Predict 函数 ---
     def predict(states):
         qs = network(states)
         if acting_in_reversible_spin_env:
@@ -107,20 +111,18 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
             return actions
         else:
             if qs.dim() == 1:
-                # 单样本: Channel 0 是自旋
-                current_spins = states.squeeze()[0, :]
-                x = (current_spins == allowed_action_state).nonzero()
+                x = (states.squeeze()[:, 0] == allowed_action_state).nonzero()
                 if x.numel() == 0:
                     actions = [0]
                 else:
                     actions = [x[qs[x].argmax().item()].item()]
             else:
-                # Batch: [Batch, Channel, Node] -> 取 Channel 0
-                disallowed_actions_mask = (states[:, 0, :] != allowed_action_state)
-                qs_allowed = qs.masked_fill(disallowed_actions_mask, -1e9)
+                disallowed_actions_mask = (states[:, :, 0] != allowed_action_state)
+                qs_allowed = qs.masked_fill(disallowed_actions_mask, -1000)
                 actions = qs_allowed.argmax(1, True).squeeze(1).cpu().numpy()
             return actions
 
+    # NETWORK TESTING
     results = []
     if return_history:
         history = []
@@ -130,42 +132,55 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
 
     for j, test_graph in enumerate(graphs_test):
 
-        pruned_nodes_rl = None
-        pruned_nodes_gr = None
         i_comp = 0
         i_batch = 0
         t_total_rl_inference = 0
-        n_spins = test_graph.shape[0]
 
+        n_spins = test_graph.shape[0]
+        # Step Budget
         if optimisation_target == OptimisationTarget.MTDS:
-            if n_spins >= 200:
-                n_steps = int(n_spins * 5.0)
-            else:
-                n_steps = int(n_spins * 3.0)
+            n_steps = int(n_spins * 2.5)
         else:
             n_steps = int(n_spins * step_factor)
 
-        test_env = ising_env.make("SpinSystem", SingleGraphGenerator(test_graph), n_steps, **env_args)
+        test_env = ising_env.make("SpinSystem",
+                                  SingleGraphGenerator(test_graph),
+                                  n_steps,
+                                  **env_args)
         test_env.immediate_reward_mode = "RL"
 
-        # === Greedy Setup ===
+        # === 1. Greedy Strategy Setup ===
+        print("Running greedy solver...", end="...")
         t_greedy_start = time.time()
         greedy_env = deepcopy(test_env)
         n = test_graph.shape[0]
-        greedy_env.reset(spins=np.ones(n))  # Greedy Reset
 
-        test_test_env = deepcopy(greedy_env)  # Copy for batching
+        # Greedy 初始化状态
+        if optimisation_target == OptimisationTarget.MTDS:
+            greedy_env.reset(spins=np.ones(n))
+        else:
+            greedy_env.reset(spins=np.ones(n))
+
+        # 制作一个干净的副本用于 Batch 复制
+        test_test_env = deepcopy(greedy_env)
 
         greedy_env.immediate_reward_mode = "GREEDY"
         greedy_agent = Greedy(greedy_env)
         _, greedy_action_list = greedy_agent.solve(random_weight=greedy_env.random_weight)
+
+        # Greedy +1 Init Raw Score (直接计数)
         raw_greedy_score = count_raw_size(greedy_env.best_spins, greedy_env.spin_basis)
+
         greedy_single_cut = raw_greedy_score
         greedy_single_spins = greedy_env.best_spins
         t_greedy_setup_time = time.time() - t_greedy_start
+        print("done.")
 
+        # Storage for RL
         best_cuts = []
         best_spins = []
+
+        # Storage for Greedy Batch
         greedy_cuts = []
         greedy_spins = []
         greedy_times = []
@@ -177,56 +192,50 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
                 batch_size = min(n_attempts - i_comp, max_batch_size)
 
             i_comp_batch = 0
+
             test_envs = [None] * batch_size
             if is_minimization:
                 best_cuts_batch = [np.inf] * batch_size
             else:
                 best_cuts_batch = [-np.inf] * batch_size
+
             best_spins_batch = [None] * batch_size
             greedy_envs = [None] * batch_size
+
             obs_batch = [None] * batch_size
+
+            # 【修复点 1】初始化 Batch 临时列表
             greedy_cuts_batch = []
             greedy_spins_batch = []
 
+            print(f"Preparing batch of {batch_size} environments...", end="...")
+
             for i in range(batch_size):
                 env = deepcopy(test_test_env)
+                # 强制显式 reset，保证 RL 和 Greedy 在同一起跑线
                 obs_batch[i] = env.reset(reset_weight=False)
                 test_envs[i] = env
-                greedy_envs[i] = deepcopy(env)
+                greedy_envs[i] = deepcopy(env)  # 复制给 Greedy 用
                 best_spins_batch[i] = env.state[0, :env.n_spins].copy()
+
+            print("done.")
 
             # --- RL Inference Loop ---
             t_start_rl = time.time()
-            safety_counter = 0
-
             while i_comp_batch < batch_size:
-                if len(obs_batch) == 0:  # Should not happen if logic is correct
-                    break
-
                 obs_batch_tensor = torch.FloatTensor(np.array(obs_batch)).to(device)
                 actions = predict(obs_batch_tensor)
                 obs_batch = []
 
-                safety_counter += 1
-                if safety_counter > n_spins * 10:
-                    print(f"\n[ERROR] Graph {j}: RL Inference stuck! Force breaking.")
-                    break
-
-                # === [核心修复] 使用 Index 指针分发动作，替代 zip ===
-                action_idx = 0
-                for i in range(batch_size):
-                    env = test_envs[i]
+                i = 0
+                for env, action in zip(test_envs, actions):
                     if env is not None:
-                        # 只有活跃的环境才分配动作
-                        action = actions[action_idx]
-                        action_idx += 1
-
                         obs, rew, done, info = env.step(action, env.random_weight, adj_mask=False)
 
                         if not done:
                             obs_batch.append(obs)
                         else:
-                            # Done logic
+                            # RL Raw Score: 直接统计 best_spins 里的个数
                             if optimisation_target == OptimisationTarget.MTDS:
                                 current_score = count_raw_size(env.best_spins, env.spin_basis)
                             else:
@@ -243,48 +252,62 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
 
                             i_comp_batch += 1
                             i_comp += 1
-                            test_envs[i] = None  # Mark as finished
+                            test_envs[i] = None
+                    i += 1
 
             t_total_rl_inference += (time.time() - t_start_rl)
             i_batch += 1
+            print("Finished agent testing batch {}.".format(i_batch))
 
-            # --- Greedy Random Init Loop ---
+            # --- Greedy Random Initialization Loop ---
             if env_args["reversible_spins"]:
                 t_greedy_batch_start = time.time()
+                print("Running greedy solver batch...", end="...")
+
                 for env in greedy_envs:
-                    n = env.n_spins
-                    env.reset(spins=np.ones(n), reset_weight=False)
+                    # Greedy 也强制 Reset，确保状态一致
+                    env.reset(reset_weight=False)
                     Greedy(env).solve(random_weight=None)
+
+                    # Greedy Raw 直接计数，绝无 Remedy 干扰
                     if optimisation_target == OptimisationTarget.MTDS:
                         raw_cut = count_raw_size(env.best_spins, env.spin_basis)
                     else:
                         raw_cut = get_best_score(env, optimisation_target)
+
+                    # 【修复点 2】添加到 Batch 列表，而不是主列表
                     greedy_cuts_batch.append(raw_cut)
                     greedy_spins_batch.append(env.best_spins.copy())
+
                 t_greedy_batch = time.time() - t_greedy_batch_start
                 greedy_times.append(t_greedy_batch)
+                print("done.")
 
             best_cuts += best_cuts_batch
             best_spins += best_spins_batch
+
+            # 【修复点 3】将 Batch 结果汇总到主列表
             if env_args["reversible_spins"]:
                 greedy_cuts += greedy_cuts_batch
                 greedy_spins += greedy_spins_batch
 
-        # ============ Post-Processing ============
+        # ============ Post-Processing & Selection ============
+
+        # 1. Select Best RL Candidate (Based on Raw Score)
         if is_minimization:
             i_best = np.argmin(best_cuts)
         else:
             i_best = np.argmax(best_cuts)
 
         sol_rl = best_spins[i_best]
+        # 使用直接计数的值作为 Raw
         if optimisation_target == OptimisationTarget.MTDS:
-            if sol_rl is None:
-                score_rl_raw = np.inf
-            else:
-                score_rl_raw = count_raw_size(sol_rl, test_env.spin_basis)
+            best_cut_raw_true = count_raw_size(sol_rl, test_env.spin_basis)
         else:
-            score_rl_raw = best_cuts[i_best]
+            best_cut_raw_true = best_cuts[i_best]
 
+        # 初始化 RL 变量
+        score_rl_raw = best_cut_raw_true
         score_rl_remedy = score_rl_raw
         score_rl_pruned = score_rl_raw
         is_rl_raw_valid = False
@@ -295,26 +318,33 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
         if optimisation_target == OptimisationTarget.MTDS:
             nx_graph = nx.from_numpy_array(test_graph)
             adj_list = nx.to_dict_of_lists(nx_graph)
-            if sol_rl is not None:
-                selected_nodes_raw_rl = {i for i, x in enumerate(sol_rl) if x == target_val_def}
-                is_rl_raw_valid = is_valid_mtds_check(nx_graph, selected_nodes_raw_rl)
 
-                t_rem_start = time.time()
-                remedied_sol_rl, _ = test_env.apply_mtds_remedy(sol_rl)
-                t_rl_remedy = time.time() - t_rem_start
-                score_rl_remedy = calculate_mtds_size(test_env.matrix, remedied_sol_rl, test_env.spin_basis)
+            # (1) Check Raw Validity (使用 target_val_def)
+            selected_nodes_raw_rl = {i for i, x in enumerate(sol_rl) if x == target_val_def}
+            is_rl_raw_valid = is_valid_mtds_check(nx_graph, selected_nodes_raw_rl)
 
-                t_prune_start = time.time()
-                selected_nodes_rem_rl = {i for i, x in enumerate(remedied_sol_rl) if x == target_val_def}
-                pruned_nodes_rl = prune_solution_fast(adj_list, selected_nodes_rem_rl)
-                score_rl_pruned = len(pruned_nodes_rl)
-                is_rl_final_valid = is_valid_mtds_check(nx_graph, pruned_nodes_rl)
-                t_rl_prune = time.time() - t_prune_start
+            # (2) Apply Remedy
+            t_rem_start = time.time()
+            remedied_sol_rl, _ = test_env.apply_mtds_remedy(sol_rl)
+            t_rl_remedy = time.time() - t_rem_start
+            score_rl_remedy = calculate_mtds_size(test_env.matrix, remedied_sol_rl, test_env.spin_basis)
+
+            # (3) Apply Pruning
+            t_prune_start = time.time()
+            # 直接使用定义的 target_val_def
+            selected_nodes_rem_rl = {i for i, x in enumerate(remedied_sol_rl) if x == target_val_def}
+            pruned_nodes_rl = prune_solution_fast(adj_list, selected_nodes_rem_rl)
+
+            score_rl_pruned = len(pruned_nodes_rl)
+            is_rl_final_valid = is_valid_mtds_check(nx_graph, pruned_nodes_rl)
+            t_rl_prune = time.time() - t_prune_start
         else:
             is_rl_raw_valid = True
             is_rl_final_valid = True
 
-        # Greedy Processing
+        # ========================================================
+        # 2. Select Best Greedy Candidate & Process
+        # ========================================================
         greedy_best_sol = None
         greedy_best_raw_initial = 0
         avg_greedy_time = 0.0
@@ -323,17 +353,20 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
             i_greedy = np.argmin(greedy_cuts) if is_minimization else np.argmax(greedy_cuts)
             greedy_best_raw_initial = greedy_cuts[i_greedy]
             greedy_best_sol = greedy_spins[i_greedy]
-            if n_attempts > 0: avg_greedy_time = np.sum(greedy_times) / n_attempts
+            if n_attempts > 0:
+                avg_greedy_time = np.sum(greedy_times) / n_attempts
         else:
             greedy_best_raw_initial = greedy_single_cut
             greedy_best_sol = greedy_single_spins
             avg_greedy_time = t_greedy_setup_time
 
+        # 再次确保 Greedy Raw 是计算出来的真实值
         if optimisation_target == OptimisationTarget.MTDS and greedy_best_sol is not None:
             score_greedy_raw = count_raw_size(greedy_best_sol, test_env.spin_basis)
         else:
             score_greedy_raw = greedy_best_raw_initial
 
+        # 初始化 Greedy 变量
         score_greedy_remedy = score_greedy_raw
         score_greedy_pruned = score_greedy_raw
         is_gr_raw_valid = False
@@ -345,17 +378,22 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
             if 'nx_graph' not in locals():
                 nx_graph = nx.from_numpy_array(test_graph)
                 adj_list = nx.to_dict_of_lists(nx_graph)
+
+            # (1) Check Greedy Raw Validity
             selected_nodes_raw_gr = {i for i, x in enumerate(greedy_best_sol) if x == target_val_def}
             is_gr_raw_valid = is_valid_mtds_check(nx_graph, selected_nodes_raw_gr)
 
+            # (2) Apply Remedy
             t_g_rem_start = time.time()
             remedied_sol_gr, _ = test_env.apply_mtds_remedy(greedy_best_sol)
             t_gr_remedy = time.time() - t_g_rem_start
             score_greedy_remedy = calculate_mtds_size(test_env.matrix, remedied_sol_gr, test_env.spin_basis)
 
+            # (3) Apply Pruning
             t_g_prune_start = time.time()
             selected_nodes_rem_gr = {i for i, x in enumerate(remedied_sol_gr) if x == target_val_def}
             pruned_nodes_gr = prune_solution_fast(adj_list, selected_nodes_rem_gr)
+
             score_greedy_pruned = len(pruned_nodes_gr)
             is_gr_final_valid = is_valid_mtds_check(nx_graph, pruned_nodes_gr)
             t_gr_prune = time.time() - t_g_prune_start
@@ -363,26 +401,35 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
             is_gr_raw_valid = True
             is_gr_final_valid = True
 
+        # Times Calculation
         avg_rl_inference = t_total_rl_inference / n_attempts if n_attempts > 0 else 0
         time_rl_total = avg_rl_inference + t_rl_remedy
         time_greedy_total = avg_greedy_time + t_gr_remedy
 
+        # ==============================================================================
+        # [新增] 提取最终解的节点编号 (RL + Remedy + Pruned)
+        # ==============================================================================
+        # pruned_nodes_rl 是一个包含节点索引的集合 (Set)，例如 {0, 5, 8}
+        # 我们将其转为排序后的列表，再转为字符串保存，例如 "[0, 5, 8]"
         rl_nodes_str = "[]"
-        if pruned_nodes_rl is not None:
+        if 'pruned_nodes_rl' in locals() and pruned_nodes_rl is not None:
             rl_nodes_str = str(sorted(list(pruned_nodes_rl)))
-        greedy_nodes_str = "[]"
-        if pruned_nodes_gr is not None:
-            greedy_nodes_str = str(sorted(list(pruned_nodes_gr)))
 
+        greedy_nodes_str = "[]"
+        if 'pruned_nodes_gr' in locals() and pruned_nodes_gr is not None:
+            greedy_nodes_str = str(sorted(list(pruned_nodes_gr)))
+        # ==============================================================================
+
+        # Formatting Output
         rl_raw_str = f"{score_rl_raw}({'V' if is_rl_raw_valid else 'X'})"
         gr_raw_str = f"{score_greedy_raw}({'V' if is_gr_raw_valid else 'X'})"
 
         print(
-            'Graph {}, SOL: {} | RL: Raw={}->Rem={}->Pru={} | Gr: Raw={}->Rem={}->Pru={} || '
+            'Graph {}, SOL: {} | RL: Raw={}->Rem={} | Gr: Raw={}->Rem={} || '
             'Time(Avg): RL={:.4f}, Gr={:.4f}'.format(
                 j, "MTDS",
-                rl_raw_str, score_rl_remedy, score_rl_pruned,
-                gr_raw_str, score_greedy_remedy, score_greedy_pruned,
+                rl_raw_str, score_rl_remedy,
+                gr_raw_str, score_greedy_remedy,
                 time_rl_total, time_greedy_total))
 
         results_master.append({
@@ -405,11 +452,14 @@ def __test_network_batched(network, env_args, graphs_test, device=None, step_fac
         })
 
     results_master = pd.DataFrame(results_master)
+
     print("\n" + "=" * 160)
     print("[DEBUG] Batched Test Results Summary")
     print("=" * 160)
-    cols = ['graph_id', 'score_rl_raw', 'valid_rl_raw', 'score_rl_remedy', 'rl_solution_nodes',
-            'score_greedy_raw', 'valid_greedy_raw', 'score_greedy_remedy', 'time_rl_total', 'time_greedy_total']
+    cols = ['graph_id',
+            'score_rl_raw', 'valid_rl_raw', 'score_rl_remedy','rl_solution_nodes',
+            'score_greedy_raw', 'valid_greedy_raw', 'score_greedy_remedy',
+            'time_rl_total', 'time_greedy_total']
     print(results_master[cols].to_string(index=False))
     print("=" * 160 + "\n")
 
