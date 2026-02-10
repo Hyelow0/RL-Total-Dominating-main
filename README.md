@@ -3,7 +3,7 @@
 
 
 ## Introduction
-`RL-Total-Dominating` is an implementation of the approach described in the paper "Learn to Solve Toatal Dominating Set Problem with GNN and Reinforcement Learning". This project combines Graph Neural Networks (GNN) and Reinforcement Learning (RL) techniques to efficiently tackle the Dominating Set Problem, a well-known problem in graph theory and combinatorial optimization.
+`RL-Total-Dominating` is an implementation of the approach described in the paper "Learn to Solve Toatal Dominating Set Problem with GNN and Reinforcement Learning". This project combines Graph Neural Networks (GNN) and Reinforcement Learning (RL) techniques to efficiently tackle the Total Dominating Set Problem, a well-known problem in graph theory and combinatorial optimization.
 
 ## Installation
 To install the necessary dependencies for `RL-Dominating`, follow these steps:
